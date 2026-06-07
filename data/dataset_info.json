@@ -2,6 +2,9 @@
   "identity": {
     "file_name": "identity.json"
   },
+  "vgrm_smoke_test": {
+    "file_name": "vgrm_smoke_test.json"
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },

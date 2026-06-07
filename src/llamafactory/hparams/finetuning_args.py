@@ -403,6 +403,34 @@ class GRAMArgument:
         default=0.0,
         metadata={"help": "Label Smoothing for GRAM."},
     )
+    vgrm_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether or not to use the variational GRAM loss."},
+    )
+    vgrm_latent_dim: int = field(
+        default=64,
+        metadata={"help": "Latent dimension used by the implicit variational subspace."},
+    )
+    vgrm_mc_samples: int = field(
+        default=4,
+        metadata={"help": "Number of Monte Carlo samples for variational label logits."},
+    )
+    vgrm_kl_weight: float = field(
+        default=1e-5,
+        metadata={"help": "Maximum KL weight for variational regularization."},
+    )
+    vgrm_kl_warmup_steps: int = field(
+        default=1000,
+        metadata={"help": "Number of optimizer steps used to linearly warm up the KL weight."},
+    )
+    vgrm_logvar_min: float = field(
+        default=-8.0,
+        metadata={"help": "Minimum clamp value for variational log-variance."},
+    )
+    vgrm_logvar_max: float = field(
+        default=4.0,
+        metadata={"help": "Maximum clamp value for variational log-variance."},
+    )
 
 
 @dataclass

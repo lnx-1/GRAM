@@ -60,8 +60,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         else:
             self.processing_class: PreTrainedTokenizer = kwargs.get("tokenizer")
 
-        if finetuning_args.gram_loss:
-            logger.info_rank0(f"Replacing GRAM Loss with original SFT Loss ...")
+        if finetuning_args.gram_loss or finetuning_args.vgrm_loss:
+            model = kwargs["model"]
+            if finetuning_args.vgrm_loss and hasattr(model, "config"):
+                model.config.output_hidden_states = True
+
+            loss_name = "VGRM" if finetuning_args.vgrm_loss else "GRAM"
+            logger.info_rank0(f"Replacing original SFT Loss with {loss_name} Loss ...")
             self.gram_candidate_labels = finetuning_args.gram_candidate_labels
             logger.info_rank0(f"GRAM candidate labels: {self.gram_candidate_labels}")
             self.gram_label_smoothing = finetuning_args.gram_label_smoothing
@@ -72,34 +77,115 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 assert len(label_token_id) == 1, f"The number of token id for labels is greater than 1. Token:{item}, Token ID: {label_token_id}"
                 self.gram_candidate_labels_token_id += label_token_id
 
-            def compute_loss_func(outputs, labels, num_items_in_batch,
+            def get_label_positions_and_targets(labels, gram_candidate_labels_token_id):
+                first_token_in_labels = [
+                    tuple(torch.nonzero(label != IGNORE_INDEX)[0].tolist())[0]
+                    for label in labels
+                ]
+                label_positions = torch.tensor(first_token_in_labels, device=labels.device)
+                candidate_token_ids = torch.tensor(gram_candidate_labels_token_id, device=labels.device)
+                label_token_ids = labels.gather(1, label_positions.unsqueeze(1)).squeeze(1)
+                label_matches = label_token_ids.unsqueeze(1).eq(candidate_token_ids.unsqueeze(0))
+                if not torch.all(label_matches.any(dim=1)):
+                    raise ValueError(
+                        f"Label token ids: {label_token_ids.tolist()}, "
+                        f"Expected token ids: {gram_candidate_labels_token_id}"
+                    )
+
+                gram_labels = label_matches.float().argmax(dim=1).long()
+                return label_positions, gram_labels, candidate_token_ids
+
+            def gather_candidate_logits(outputs, labels, gram_candidate_labels_token_id):
+                label_positions, gram_labels, candidate_token_ids = get_label_positions_and_targets(
+                    labels, gram_candidate_labels_token_id
+                )
+                batch_indices = torch.arange(labels.size(0), device=labels.device)
+                decision_positions = label_positions - 1
+                logits = outputs.logits[batch_indices, decision_positions]
+                return logits.index_select(dim=1, index=candidate_token_ids), gram_labels
+
+            def project_candidate_logits(hidden_states, candidate_token_ids, output_embeddings):
+                candidate_weights = output_embeddings.weight.index_select(
+                    dim=0, index=candidate_token_ids.to(output_embeddings.weight.device)
+                ).to(hidden_states.device)
+                candidate_weights = candidate_weights.to(hidden_states.dtype)
+                logits = torch.matmul(hidden_states, candidate_weights.transpose(0, 1))
+                bias = getattr(output_embeddings, "bias", None)
+                if bias is not None:
+                    candidate_bias = bias.index_select(
+                        dim=0, index=candidate_token_ids.to(bias.device)
+                    ).to(hidden_states.device)
+                    logits = logits + candidate_bias.to(logits.dtype)
+
+                return logits
+
+            def compute_gram_loss(outputs, labels, num_items_in_batch,
                                   gram_candidate_labels_token_id=self.gram_candidate_labels_token_id,
                                   label_smoothing=self.gram_label_smoothing):
-                # outputs = model(**inputs)
-                first_token_in_labels = []
-                for idx, label in enumerate(labels):
-                    first_token_in_labels.append([tuple(torch.nonzero(label != -100)[0].tolist())[0]])
-
-                first_token_in_labels = torch.tensor(first_token_in_labels, device=labels.device)
-
-                logits_first_token_in_labels = torch.cat([item[(idx[0]-1).unsqueeze(0)] for idx, item in zip(first_token_in_labels, outputs.logits)], dim=0)
-                logits_candidate_tokens = logits_first_token_in_labels[:, gram_candidate_labels_token_id]
-
-                gram_labels = []
-                for item in torch.gather(labels, 1, first_token_in_labels):
-                    assert item in gram_candidate_labels_token_id, \
-                        f"Label token id: {item}, Expected token ids: {str(gram_candidate_labels_token_id)}"
-                    gram_labels.append(gram_candidate_labels_token_id.index(item))
-
-                cross_entropy_loss = torch.nn.CrossEntropyLoss(
+                logits_candidate_tokens, gram_labels = gather_candidate_logits(
+                    outputs, labels, gram_candidate_labels_token_id
+                )
+                return torch.nn.CrossEntropyLoss(
                     label_smoothing=label_smoothing
                 )(
-                    logits_candidate_tokens,
-                    torch.tensor(gram_labels, device=logits_candidate_tokens.device)
+                    logits_candidate_tokens.float(),
+                    gram_labels
                 )
-                return cross_entropy_loss
 
-            kwargs["compute_loss_func"] = compute_loss_func
+            def compute_vgrm_loss(outputs, labels, num_items_in_batch,
+                                   gram_candidate_labels_token_id=self.gram_candidate_labels_token_id,
+                                   label_smoothing=self.gram_label_smoothing,
+                                   latent_dim=finetuning_args.vgrm_latent_dim,
+                                   mc_samples=finetuning_args.vgrm_mc_samples,
+                                   kl_weight=finetuning_args.vgrm_kl_weight,
+                                   kl_warmup_steps=finetuning_args.vgrm_kl_warmup_steps,
+                                   logvar_min=finetuning_args.vgrm_logvar_min,
+                                   logvar_max=finetuning_args.vgrm_logvar_max):
+                if outputs.hidden_states is None:
+                    raise ValueError("VGRM loss requires `output_hidden_states=True` in the model config.")
+
+                label_positions, gram_labels, candidate_token_ids = get_label_positions_and_targets(
+                    labels, gram_candidate_labels_token_id
+                )
+                batch_indices = torch.arange(labels.size(0), device=labels.device)
+                decision_positions = label_positions - 1
+                decision_states = outputs.hidden_states[-1][batch_indices, decision_positions]
+                hidden_size = decision_states.size(-1)
+                if latent_dim * 2 > hidden_size:
+                    raise ValueError(
+                        f"`vgrm_latent_dim * 2` must be <= hidden size, got "
+                        f"{latent_dim} * 2 > {hidden_size}."
+                    )
+
+                mu = decision_states[:, :latent_dim].float()
+                logvar = decision_states[:, latent_dim: 2 * latent_dim].float().clamp(logvar_min, logvar_max)
+                std = torch.exp(0.5 * logvar)
+                num_samples = max(1, mc_samples)
+                eps = torch.randn(
+                    labels.size(0), num_samples, latent_dim, device=decision_states.device, dtype=torch.float32
+                )
+                sampled_z = mu.unsqueeze(1) + std.unsqueeze(1) * eps
+                sampled_states = decision_states.float().unsqueeze(1).expand(-1, num_samples, -1).clone()
+                sampled_states[:, :, :latent_dim] = sampled_z
+                output_embeddings = model.get_output_embeddings()
+                sampled_logits = project_candidate_logits(
+                    sampled_states.to(decision_states.dtype), candidate_token_ids, output_embeddings
+                ).float()
+                expanded_labels = gram_labels.unsqueeze(1).expand(-1, num_samples).reshape(-1)
+                preference_loss = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)(
+                    sampled_logits.reshape(-1, sampled_logits.size(-1)),
+                    expanded_labels,
+                )
+                kl_loss = 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1.0).sum(dim=-1).mean()
+                if kl_warmup_steps > 0:
+                    current_step = max(0, getattr(getattr(self, "state", None), "global_step", 0))
+                    kl_scale = min(1.0, float(current_step) / float(kl_warmup_steps))
+                else:
+                    kl_scale = 1.0
+
+                return preference_loss + (kl_weight * kl_scale * kl_loss)
+
+            kwargs["compute_loss_func"] = compute_vgrm_loss if finetuning_args.vgrm_loss else compute_gram_loss
 
         super().__init__(**kwargs)
         if processor is not None:

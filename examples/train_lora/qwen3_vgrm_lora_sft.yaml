@@ -1,0 +1,63 @@
+### model
+model_name_or_path: /home/mona/tutu_poj/graduate_paper/gram_modeldata/Qwen3-1.7B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+# LoRA hyperparams
+lora_rank: 8
+lora_target: all
+lora_dropout: 0.05
+
+### dataset
+dataset: vgrm_smoke_test
+template: qwen3
+cutoff_len: 2048
+# 为了本地开发/调试默认限制样本数；线下训练可设为 null 或删除此行
+max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+enable_thinking: false
+
+### output
+output_dir: saves/qwen3-1.7b/lora/vgrm-smoke
+logging_steps: 10
+save_strategy: epoch
+plot_loss: true
+overwrite_output_dir: true
+save_only_model: true
+report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 4
+learning_rate: 2.0e-5
+num_train_epochs: 2.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+resume_from_checkpoint: null
+
+### eval
+# eval_dataset: alpaca_en_demo
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
+
+## VGRM
+vgrm_loss: true
+gram_candidate_labels:
+  - "A"
+  - "B"
+gram_label_smoothing: 0.1
+vgrm_latent_dim: 64
+vgrm_mc_samples: 4
+vgrm_kl_weight: 1.0e-5
+vgrm_kl_warmup_steps: 1000
+vgrm_logvar_min: -8.0
+vgrm_logvar_max: 4.0
