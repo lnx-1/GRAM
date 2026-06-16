@@ -5,6 +5,9 @@
   "vgrm_smoke_test": {
     "file_name": "vgrm_smoke_test.json"
   },
+  "gram_ft_65k": {
+    "file_name": "/home/mona/tutu_poj/graduate_paper/gram_modeldata/GRAM-fine-tuning-65k/data.json"
+  },
   "alpaca_en_demo": {
     "file_name": "alpaca_en_demo.json"
   },

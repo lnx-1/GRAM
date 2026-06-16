@@ -6,49 +6,43 @@ trust_remote_code: true
 stage: sft
 do_train: true
 finetuning_type: lora
-# LoRA hyperparams
 lora_rank: 8
 lora_target: all
 lora_dropout: 0.05
 
 ### dataset
-dataset: vgrm_smoke_test
+dataset: gram_ft_65k
 template: qwen3
-cutoff_len: 1024
-# 为了本地开发/调试默认限制样本数；线下训练可设为 null 或删除此行
-max_samples: 1000
+cutoff_len: 2048
+max_samples: 20000
 overwrite_cache: true
-preprocessing_num_workers: 16
-dataloader_num_workers: 4
+preprocessing_num_workers: 4
+dataloader_num_workers: 0
 enable_thinking: false
 
 ### output
-output_dir: saves/qwen3-1.7b/lora/vgrm-smoke
-logging_steps: 10
-save_strategy: epoch
+output_dir: saves/qwen3-1.7b/lora/vgrm-20k
+logging_steps: 20
+save_strategy: steps
+save_steps: 300
+save_total_limit: 3
 plot_loss: true
 overwrite_output_dir: true
 save_only_model: true
-report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
+report_to: none
 
 ### train
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 16
 gradient_checkpointing: true
-learning_rate: 2.0e-5
+learning_rate: 1.0e-5
 num_train_epochs: 2.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
+max_grad_norm: 1.0
 bf16: true
 ddp_timeout: 180000000
 resume_from_checkpoint: null
-
-### eval
-# eval_dataset: alpaca_en_demo
-# val_size: 0.1
-# per_device_eval_batch_size: 1
-# eval_strategy: steps
-# eval_steps: 500
 
 ## VGRM
 vgrm_loss: true
