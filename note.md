@@ -74,7 +74,6 @@ python3 evaluation/get_reward_bench_score.py saves/qwen3-1.7b/lora/vgrm-smoke-me
     -bm /home/mona/tutu_poj/graduate_paper/gram_modeldata/Qwen3-1.7B \
     -o saves/qwen3-1.7b/lora/vgrm-20k-merged/rewardbench_eval.jsonl \
     -b 1 --latent-dim 64 --mc-samples 8
-    -b 1 --latent-dim 64 --mc-samples 8
 
   第 3 步:计算 RewardBench 分数
 
