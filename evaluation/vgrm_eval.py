@@ -19,6 +19,10 @@ parser.add_argument("--logvar-min", type=float, default=-8.0)
 parser.add_argument("--logvar-max", type=float, default=4.0)
 parser.add_argument("--label-a", default="A")
 parser.add_argument("--label-b", default="B")
+# 不确定性聚合权重：三项各自标准化(z-score)后按这些权重加权求和
+parser.add_argument("--w-entropy", type=float, default=1.0, help="weight for standardized predictive_entropy")
+parser.add_argument("--w-mc-variance", type=float, default=1.0, help="weight for standardized mc_variance")
+parser.add_argument("--w-latent", type=float, default=1.0, help="weight for standardized latent_uncertainty")
 args = parser.parse_args()
 
 if os.path.exists(args.output):
@@ -110,15 +114,16 @@ def compute_vgrm_scores(outputs, batch_size):
     mc_variance = probs.var(dim=1, unbiased=False).view(batch_size, 2, 2).mean(dim=1)
     latent_uncertainty = logvar.exp().mean(dim=-1).view(batch_size, 2).mean(dim=1)
     entropy = -(scores.clamp_min(1e-8) * scores.clamp_min(1e-8).log()).sum(dim=-1)
-    uncertainty = entropy + mc_variance.mean(dim=-1) + latent_uncertainty
-    return scores, mc_variance, latent_uncertainty, entropy, uncertainty
+    # 注意：总不确定性不在此处聚合。三项量纲不同，需在全数据集上各自做 z-score
+    # 标准化后再按权重求和（见主循环结束后的全局聚合），避免某一项因数值范围大而主导排序。
+    return scores, mc_variance, latent_uncertainty, entropy
 
 
 with open(args.input, "r", encoding="utf-8") as f:
     input_data = json.load(f)
 
+all_results = []
 for idx in trange(0, len(input_data), args.batch_size):
-    res = []
     batch_data = input_data[idx: idx + args.batch_size]
     current_batch_size = len(batch_data)
     messages = []
@@ -133,7 +138,7 @@ for idx in trange(0, len(input_data), args.batch_size):
 
     with torch.no_grad():
         output = model(**inputs, output_hidden_states=True)
-        scores, mc_variance, latent_uncertainty, entropy, uncertainty = compute_vgrm_scores(
+        scores, mc_variance, latent_uncertainty, entropy = compute_vgrm_scores(
             output, current_batch_size
         )
 
@@ -145,10 +150,37 @@ for idx in trange(0, len(input_data), args.batch_size):
         data_item["mc_variance_rejected"] = float(mc_variance[row_idx, 1].item())
         data_item["latent_uncertainty"] = float(latent_uncertainty[row_idx].item())
         data_item["predictive_entropy"] = float(entropy[row_idx].item())
-        data_item["uncertainty"] = float(uncertainty[row_idx].item())
-        res.append(data_item)
+        # mc_variance 的标量形式（两方向均值），供后续标准化使用
+        data_item["mc_variance"] = 0.5 * (
+            data_item["mc_variance_chosen"] + data_item["mc_variance_rejected"]
+        )
+        all_results.append(data_item)
 
-    mode = "a" if os.path.exists(args.output) else "w"
-    with open(args.output, mode, encoding="utf-8") as f:
-        for item in res:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+def _standardize(values):
+    """z-score 标准化；标准差为 0 时退化为全 0，避免除零。"""
+    n = len(values)
+    mean = sum(values) / n
+    var = sum((v - mean) ** 2 for v in values) / n
+    std = var ** 0.5
+    if std < 1e-12:
+        return [0.0] * n
+    return [(v - mean) / std for v in values]
+
+
+# 在全数据集上对三项各自做 z-score 标准化，再按权重加权求和得到总不确定性。
+z_entropy = _standardize([r["predictive_entropy"] for r in all_results])
+z_mc = _standardize([r["mc_variance"] for r in all_results])
+z_latent = _standardize([r["latent_uncertainty"] for r in all_results])
+
+for r, ze, zm, zl in zip(all_results, z_entropy, z_mc, z_latent):
+    r["z_predictive_entropy"] = ze
+    r["z_mc_variance"] = zm
+    r["z_latent_uncertainty"] = zl
+    r["uncertainty"] = (
+        args.w_entropy * ze + args.w_mc_variance * zm + args.w_latent * zl
+    )
+
+with open(args.output, "w", encoding="utf-8") as f:
+    for item in all_results:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
