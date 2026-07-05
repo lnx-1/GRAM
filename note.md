@@ -57,7 +57,7 @@ python3 evaluation/get_reward_bench_score.py saves/qwen3-1.7b/lora/vgrm-smoke-me
 
   cd /home/mona/tutu_poj/graduate_paper/paper_design_2026/GRAM
   llamafactory-cli export \
-    --model_name_or_path /home/mona/tutu_poj/graduate_paper/gram_modeldata/Qwen3-1.7B \
+    --model_name_or_path /root/autodl-tmp/mydpaper/model/Qwen3-1.7B \
     --adapter_name_or_path saves/qwen3-1.7b/lora/vgrm-20k \
     --template qwen3 --finetuning_type lora \
     --export_dir saves/qwen3-1.7b/lora/vgrm-20k-merged \
@@ -91,3 +91,71 @@ python3 evaluation/get_reward_bench_score.py saves/qwen3-1.7b/lora/vgrm-smoke-me
   - 第 3 步这次四大组都会有数据,不再是冒烟时的 No data available。
 
 ```
+
+## 重新修改评估脚本后的评估流程
+
+首先先进行模型合并，参考上文
+然后进行以下步骤
+```
+第 2 步：在 RewardBench 上跑推理
+
+python3 evaluation/vgrm_eval.py \
+  -i evaluation/allenai_reward_bench/filtered.json \
+  -m saves/qwen3-1.7b/lora/vgrm-20k-merged \
+  -bm /root/autodl-tmp/mydpaper/model/Qwen3-1.7B \
+  -o /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/rewardbench_eval.jsonl \
+  -b 8 --latent-dim 64 --mc-samples 8 \
+  --w-entropy 1.0 --w-mc-variance 1.0 --w-latent 1.0 \
+  > /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/eval_rewardbench.log 2>&1 & tail -f /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/eval_rewardbench.log
+
+第 3 步：计算 RewardBench 分数（按 chat/chat-hard/safety/reasoning 四组算准确率）
+
+python3 evaluation/get_reward_bench_score.py \
+  /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/rewardbench_eval.jsonl \
+  | tee /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/rewardbench_score.txt
+
+第 4 步（可选）：离线调不确定性权重 + 看 coverage-accuracy
+
+不用重跑模型，直接在第 2 步产物上重算：
+
+
+python3 evaluation/recompute_uncertainty.py \
+  /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/rewardbench_eval.jsonl \
+  --w-entropy 1.0 --w-mc-variance 1.0 --w-latent 1.0 \
+  | tee /root/autodl-tmp/mydpaper/experiments/vgrm-20k/eval/coverage_accuracy.txt
+```
+
+# 提交内容分析
+
+## 92dbc62 三类各自标准化
+
+提交说明:记得后续增大 kl_weight(训练侧 TODO,与本次改动无关)。
+
+### 影响范围
+
+- 只改了 `evaluation/` 下两个文件:`vgrm_eval.py`(改)、`recompute_uncertainty.py`(新增)。
+- 完全没碰 `src/` 训练代码,**不影响训练阶段**。属于纯评估/推理阶段改动,与训练损失解耦。
+- 训练阶段的不确定性是另一回事:`compute_vgrm_loss` 里的 KL 正则项(由 `vgrm_kl_weight` 控制),本次未动。
+
+### 三种不确定性来源(模型一次前向后产出)
+
+1. `predictive_entropy`(预测熵):偏好分布 softmax([s_A, s_B]) 的熵,反映"模型对 A/B 谁更好有多犹豫"。
+2. `mc_variance`(MC 方差):对隐变量做 mc_samples 次重参数化采样,偏好概率在多次采样间的方差,反映"采样扰动下结论稳不稳"。
+3. `latent_uncertainty`(隐空间不确定性):exp(logvar) 的均值,即变分后验方差本身,反映"隐空间对该样本表征有多发散"。
+
+### 本次核心改动:三项的聚合方式
+
+- 改之前:`uncertainty = entropy + mc_variance + latent_uncertainty` 直接相加。问题是三项量纲/数值范围不同,数值大的那项会主导排序。
+- 改之后:在**全数据集**上对三项各自做 z-score 标准化(减均值除标准差,std≈0 时退化为全 0 防除零),再按可调权重 `--w-entropy / --w-mc-variance / --w-latent` 加权求和。
+- 因为标准化需要全数据集统计量,代码结构从"算一批写一批"改成**先收集 all_results,全部跑完再统一标准化,最后一次性写盘**。
+
+### 新增 recompute_uncertainty.py
+
+- 在已有 eval 输出 jsonl 上**离线重算**标准化加权不确定性,无需重跑模型推理,方便反复调三个权重做对比。
+- 用法:`python3 evaluation/recompute_uncertainty.py <eval.jsonl> [--w-entropy 1.0] [--w-mc-variance 1.0] [--w-latent 1.0] [-o 输出.jsonl]`
+
+### 评估指标:coverage-accuracy(选择性预测曲线)
+
+- 把样本按 uncertainty 从低到高排序,只保留模型最确信的前 50% / 70% / 90% / 100%,看子集上判对率(correct)是否随之上升。
+- 核心命题:好的不确定性应与正确性负相关——越不确信越容易判错,丢掉高不确定性样本后 accuracy 应提高。
+- recompute_uncertainty.py 还会对三项**单独各跑一遍**这条曲线,判断哪一项最有区分度(最能筛出错误预测),指导权重该怎么设。
